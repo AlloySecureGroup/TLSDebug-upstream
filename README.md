@@ -131,6 +131,46 @@ Firefox uses its own certificate store:
 3. Select `proxy-ca.crt`
 4. Check "Trust this CA to identify websites"
 
+## Exporting the CA Certificate to Another Machine
+
+If the proxy runs somewhere your browser doesn't have filesystem access to — a
+remote host, a container, a VM — you don't need to `docker cp` or `scp`
+`proxy-ca.crt` around. There are three ways to get it out, in order of
+convenience:
+
+**1. Download it while the proxy is running:**
+```bash
+curl -o proxy-ca.crt http://<proxy-host>:4040/ca-cert
+```
+or on Windows:
+```powershell
+Invoke-WebRequest http://<proxy-host>:4040/ca-cert -OutFile proxy-ca.crt
+```
+This serves the certificate from memory (whatever `-certdir` is set to
+doesn't matter) on the same port as the web monitor.
+
+**2. Export it without starting the proxy:**
+```bash
+./tlsproxy -export-ca proxy-ca.crt   # write to a file
+./tlsproxy -export-ca -              # print PEM to stdout
+```
+
+**3. Copy it from the console output:** every startup logs the full CA
+certificate PEM plus ready-to-run Windows import commands (see next
+section) — useful when you only have log access (e.g. `docker logs`) and no
+network path to the monitor port at all.
+
+### One-step import on a Windows workstation
+
+Combine method 1 with PowerShell's `Import-Certificate` to fetch and install
+in a single command (no admin rights needed for the current-user store):
+```powershell
+Invoke-WebRequest http://<proxy-host>:4040/ca-cert -OutFile "$env:TEMP\tlsproxy-ca.crt"
+Import-Certificate -FilePath "$env:TEMP\tlsproxy-ca.crt" -CertStoreLocation Cert:\CurrentUser\Root
+```
+Replace `<proxy-host>` with `localhost` if the proxy is local, or the
+machine's actual address/port-forward target otherwise.
+
 ## Usage
 
 ### Configure Your Client
@@ -163,8 +203,10 @@ requests.get('https://api.example.com', proxies=proxies, verify='proxy-ca.crt')
 
 ```
 -port int          Proxy port (default 8080)
+-monitor-port int  Web monitor port, also serves /ca-cert (default 4040)
 -certdir string    Certificate directory (default ".")
 -config string     Configuration file (default "proxy-config.ini")
+-export-ca string  Export the CA certificate PEM to this path ('-' for stdout) and exit
 -cleanup          Remove CA certificates and exit
 -skip-install     Skip automatic certificate installation
 ```

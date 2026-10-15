@@ -1113,6 +1113,9 @@ func StartMonitorServer(port int) {
 	http.HandleFunc("/api/entry/", handleAPIEntry)
 	http.HandleFunc("/api/clear", handleAPIClear)
 	http.HandleFunc("/api/stats", handleAPIStats)
+	http.HandleFunc("/ca-cert", handleCACertDownload)
+	http.HandleFunc("/ca.crt", handleCACertDownload)
+	http.HandleFunc("/install-ca", handleInstallCAPage)
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("[MONITOR] Starting monitor server on http://localhost%s", addr)
@@ -1123,6 +1126,252 @@ func StartMonitorServer(port int) {
 		}
 	}()
 }
+
+// handleCACertDownload serves the CA certificate as a downloadable .crt
+// file so it can be exported with a single request (curl/Invoke-WebRequest,
+// or opening the URL in a browser) instead of copying PEM text by hand.
+// It re-encodes the in-memory certificate rather than reading proxy-ca.crt
+// off disk, so it works the same regardless of -certdir.
+func handleCACertDownload(w http.ResponseWriter, r *http.Request) {
+	if caCert == nil {
+		http.Error(w, "CA certificate not yet initialized", http.StatusServiceUnavailable)
+		return
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})
+	w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+	w.Header().Set("Content-Disposition", `attachment; filename="tlsproxy-ca.crt"`)
+	w.Write(pemBytes)
+}
+
+// handleInstallCAPage serves a self-service, OS-aware HTML page that lets a
+// *remote* client (any device whose traffic is being intercepted, not just
+// the machine running the proxy) download the CA certificate and get
+// copy/paste-able instructions for trusting it on their own device -
+// Windows, macOS, Linux, Android, or iOS. The download link is built from
+// the request's own Host header, so it works correctly no matter which
+// address/port the client used to reach the monitor (localhost, LAN IP, or
+// a hostname), unlike the fixed "localhost" URL printed on the server console.
+func handleInstallCAPage(w http.ResponseWriter, r *http.Request) {
+	if caCert == nil {
+		http.Error(w, "CA certificate not yet initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	downloadURL := fmt.Sprintf("http://%s/ca-cert", r.Host)
+	subject := "TLS Proxy Root CA"
+	if certConfig != nil {
+		subject = fmt.Sprintf("CN=%s, O=%s", certConfig.CommonName, certConfig.Organization)
+	}
+	expiry := caCert.NotAfter.Format("2006-01-02")
+
+	page := strings.NewReplacer(
+		"{{DOWNLOAD_URL}}", downloadURL,
+		"{{SUBJECT}}", subject,
+		"{{EXPIRY}}", expiry,
+	).Replace(installCAPageHTML)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, page)
+}
+
+const installCAPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Install CA Certificate</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            padding: 0 0 40px;
+        }
+        .header {
+            background: #fff;
+            padding: 20px 30px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        .header h1 { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+        .header p { color: #666; font-size: 13px; }
+        .container { max-width: 760px; margin: 0 auto; padding: 0 20px; }
+        .card {
+            background: #fff;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 24px;
+            margin-top: 24px;
+        }
+        .card h2 { font-size: 15px; margin-bottom: 10px; }
+        .meta { font-size: 13px; color: #555; line-height: 1.8; }
+        .meta code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+        .download-btn {
+            display: inline-block;
+            margin-top: 14px;
+            padding: 10px 20px;
+            background: #1976d2;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .download-btn:hover { background: #1558a8; }
+        .tabs {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-top: 24px;
+            border-bottom: 1px solid #e0e0e0;
+            padding-bottom: 0;
+        }
+        .tab-btn {
+            padding: 8px 14px;
+            border: 1px solid #e0e0e0;
+            border-bottom: none;
+            border-radius: 4px 4px 0 0;
+            background: #fafafa;
+            color: #555;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .tab-btn.active { background: #fff; color: #1976d2; font-weight: 600; }
+        .tab-panel { display: none; background: #fff; border: 1px solid #e0e0e0; border-top: none; padding: 20px; border-radius: 0 0 6px 6px; }
+        .tab-panel.active { display: block; }
+        .tab-panel h3 { font-size: 14px; margin: 14px 0 6px; }
+        .tab-panel h3:first-child { margin-top: 0; }
+        .tab-panel ol, .tab-panel ul { margin-left: 20px; margin-bottom: 10px; font-size: 13px; line-height: 1.7; }
+        .tab-panel p { font-size: 13px; line-height: 1.6; margin-bottom: 10px; color: #444; }
+        pre {
+            background: #272822;
+            color: #f8f8f2;
+            padding: 12px 14px;
+            border-radius: 4px;
+            font-size: 12.5px;
+            overflow-x: auto;
+            margin-bottom: 10px;
+        }
+        .note {
+            background: #fff8e1;
+            border: 1px solid #ffe082;
+            border-radius: 4px;
+            padding: 10px 14px;
+            font-size: 12.5px;
+            color: #7a5c00;
+            margin-top: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Install the TLS Proxy CA Certificate</h1>
+        <p>Trust this certificate on your device so intercepted HTTPS connections don't show warnings.</p>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h2>1. Download the certificate</h2>
+            <div class="meta">
+                Subject: <code>{{SUBJECT}}</code><br>
+                Valid until: <code>{{EXPIRY}}</code><br>
+                Download URL: <code>{{DOWNLOAD_URL}}</code>
+            </div>
+            <a class="download-btn" href="{{DOWNLOAD_URL}}" download="tlsproxy-ca.crt">Download CA Certificate</a>
+        </div>
+
+        <h2 style="margin-top:28px; font-size:15px;">2. Install it on your device</h2>
+        <div class="tabs" id="tabs">
+            <button class="tab-btn" data-tab="windows">Windows</button>
+            <button class="tab-btn" data-tab="macos">macOS</button>
+            <button class="tab-btn" data-tab="linux">Linux</button>
+            <button class="tab-btn" data-tab="android">Android</button>
+            <button class="tab-btn" data-tab="ios">iOS</button>
+        </div>
+
+        <div class="tab-panel" data-tab="windows">
+            <h3>Option A - PowerShell (one command)</h3>
+            <pre>Invoke-WebRequest {{DOWNLOAD_URL}} -OutFile "$env:TEMP\tlsproxy-ca.crt"; Import-Certificate -FilePath "$env:TEMP\tlsproxy-ca.crt" -CertStoreLocation Cert:\CurrentUser\Root</pre>
+            <h3>Option B - GUI</h3>
+            <ol>
+                <li>Download the certificate using the button above.</li>
+                <li>Double-click the downloaded <code>tlsproxy-ca.crt</code> file.</li>
+                <li>Click <b>Install Certificate</b>.</li>
+                <li>Store Location: <b>Current User</b> (or Local Machine, needs admin).</li>
+                <li>Choose <b>Place all certificates in the following store</b> &rarr; <b>Trusted Root Certification Authorities</b>.</li>
+                <li>Click <b>Next</b>, then <b>Finish</b>, and accept the security warning.</li>
+            </ol>
+        </div>
+
+        <div class="tab-panel" data-tab="macos">
+            <h3>Option A - Terminal</h3>
+            <pre>curl -o ~/Downloads/tlsproxy-ca.crt {{DOWNLOAD_URL}}
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/Downloads/tlsproxy-ca.crt</pre>
+            <h3>Option B - GUI</h3>
+            <ol>
+                <li>Download the certificate using the button above.</li>
+                <li>Double-click it to open it in <b>Keychain Access</b>.</li>
+                <li>Find it under the <b>System</b> keychain, double-click it.</li>
+                <li>Expand <b>Trust</b> and set <b>When using this certificate</b> to <b>Always Trust</b>.</li>
+                <li>Close the window and enter your password to confirm.</li>
+            </ol>
+        </div>
+
+        <div class="tab-panel" data-tab="linux">
+            <h3>Debian / Ubuntu</h3>
+            <pre>curl -o tlsproxy-ca.crt {{DOWNLOAD_URL}}
+sudo cp tlsproxy-ca.crt /usr/local/share/ca-certificates/tlsproxy.crt
+sudo update-ca-certificates</pre>
+            <h3>Fedora / RHEL / CentOS</h3>
+            <pre>curl -o tlsproxy-ca.crt {{DOWNLOAD_URL}}
+sudo cp tlsproxy-ca.crt /etc/pki/ca-trust/source/anchors/tlsproxy.crt
+sudo update-ca-trust</pre>
+        </div>
+
+        <div class="tab-panel" data-tab="android">
+            <ol>
+                <li>Open this page in your device's browser and tap the <b>Download CA Certificate</b> button above (or visit <code>{{DOWNLOAD_URL}}</code> directly).</li>
+                <li>Go to <b>Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate</b> (path varies by Android version/OEM).</li>
+                <li>Tap <b>Install anyway</b>, then select the downloaded file.</li>
+                <li>Name it (e.g. "TLS Proxy CA") and confirm.</li>
+            </ol>
+            <div class="note">Android 7+ only trusts user-installed CAs for apps that explicitly opt in via their network security config. The system browser (Chrome) respects the user CA store, but many apps will still reject the intercepted connection.</div>
+        </div>
+
+        <div class="tab-panel" data-tab="ios">
+            <ol>
+                <li>Open <code>{{DOWNLOAD_URL}}</code> in <b>Safari</b> on the device (must be Safari, not another browser).</li>
+                <li>Tap <b>Allow</b> when prompted that this site is trying to download a configuration profile.</li>
+                <li>Go to <b>Settings &rarr; General &rarr; VPN &amp; Device Management</b>, tap the downloaded profile, then <b>Install</b> (enter your passcode).</li>
+                <li>Go to <b>Settings &rarr; General &rarr; About &rarr; Certificate Trust Settings</b> and enable <b>Full Trust</b> for this certificate.</li>
+            </ol>
+            <div class="note">Installing the profile alone is not enough - you must also enable full trust in Certificate Trust Settings, or TLS connections will still fail.</div>
+        </div>
+
+        <div class="note">
+            This CA can decrypt and inspect any HTTPS traffic from a device that trusts it. Only install it on devices you intend to have monitored, and remove it when you're done (reverse the steps above, or delete it from the certificate/keychain manager).
+        </div>
+    </div>
+
+    <script>
+        var tabs = document.querySelectorAll('.tab-btn');
+        var panels = document.querySelectorAll('.tab-panel');
+        function activate(name) {
+            tabs.forEach(function(b) { b.classList.toggle('active', b.dataset.tab === name); });
+            panels.forEach(function(p) { p.classList.toggle('active', p.dataset.tab === name); });
+        }
+        tabs.forEach(function(b) {
+            b.addEventListener('click', function() { activate(b.dataset.tab); });
+        });
+        var ua = navigator.userAgent || '';
+        var guess = 'windows';
+        if (/Android/i.test(ua)) guess = 'android';
+        else if (/iPhone|iPad|iPod/i.test(ua)) guess = 'ios';
+        else if (/Macintosh|Mac OS X/i.test(ua)) guess = 'macos';
+        else if (/Linux/i.test(ua) && !/Android/i.test(ua)) guess = 'linux';
+        activate(guess);
+    </script>
+</body>
+</html>`
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1693,6 +1942,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         </label>
         <button onclick="loadEntries()">Refresh</button>
         <button class="danger" onclick="clearEntries()">Clear All</button>
+        <a href="/install-ca" target="_blank" rel="noopener" style="margin-left:auto; padding:8px 16px; border:1px solid #1976d2; border-radius:4px; background:#1976d2; color:#fff; font-size:13px; font-weight:500; text-decoration:none;">Install CA Certificate</a>
     </div>
     
     <div class="table-container">
@@ -2202,6 +2452,7 @@ func main() {
 	configFile := flag.String("config", "proxy-config.ini", "Configuration file path")
 	monitorPort := flag.Int("monitor-port", 4040, "Monitor web interface port")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging (log all traffic to console)")
+	exportCA := flag.String("export-ca", "", "Export the CA certificate PEM to this path ('-' for stdout) and exit, without starting the proxy")
 	flag.Parse()
 
 	verboseMode = *verbose
@@ -2224,6 +2475,13 @@ func main() {
 		log.Fatalf("Failed to initialize CA: %v", err)
 	}
 
+	if *exportCA != "" {
+		if err := exportCACert(*exportCA); err != nil {
+			log.Fatalf("Failed to export CA certificate: %v", err)
+		}
+		return
+	}
+
 	var err error
 	logWriter, err = os.OpenFile(config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
@@ -2234,6 +2492,8 @@ func main() {
 	initializeModules()
 
 	StartMonitorServer(*monitorPort)
+
+	printCACertExportImportInfo(*monitorPort)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
 	if err != nil {
@@ -3202,6 +3462,84 @@ func uninstallCertLinux() error {
 	}
 
 	return nil
+}
+
+// exportCACert writes the loaded CA certificate as PEM to the given path,
+// or to stdout when path is "-". It's the scriptable counterpart to the
+// download endpoint and console printout below, for e.g. pulling the cert
+// out of a running/remote instance in an automated setup step:
+//
+//	./tlsproxy -export-ca ca.crt
+//	./tlsproxy -export-ca - > ca.crt
+func exportCACert(path string) error {
+	if caCert == nil {
+		return fmt.Errorf("CA certificate not loaded")
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})
+
+	if path == "-" {
+		_, err := os.Stdout.Write(pemBytes)
+		return err
+	}
+	if err := os.WriteFile(path, pemBytes, 0644); err != nil {
+		return err
+	}
+	log.Printf("CA certificate exported to %s", path)
+	return nil
+}
+
+// printCACertExportImportInfo prints the CA certificate as copy/paste-able
+// PEM text, the URL it can be downloaded from while the proxy is running,
+// and ready-to-run Windows import commands (PowerShell and certutil). This
+// covers the case where the proxy runs somewhere the operator's Windows
+// workstation can't reach the filesystem directly (a remote host, a
+// container, etc.), so everything needed to export and import the CA is
+// copyable straight out of the console/log output.
+func printCACertExportImportInfo(monitorPort int) {
+	if caCert == nil {
+		return
+	}
+	pemText := strings.TrimRight(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})), "\r\n")
+	downloadURL := fmt.Sprintf("http://localhost:%d/ca-cert", monitorPort)
+	installURL := fmt.Sprintf("http://localhost:%d/install-ca", monitorPort)
+
+	log.Println("")
+	log.Println("================================================================")
+	log.Println(" CA CERTIFICATE - export & import on a Windows workstation")
+	log.Println("================================================================")
+	if certConfig != nil {
+		log.Printf(" Subject: CN=%s, O=%s", certConfig.CommonName, certConfig.Organization)
+	}
+	log.Println(" NOTE: if this host's certificate storage isn't persisted")
+	log.Println(" (e.g. an ephemeral container), a restart generates a NEW CA")
+	log.Println(" and you'll need to export/import it again.")
+	log.Println("")
+	log.Printf(" Remote clients: send them to %s for a self-service", installURL)
+	log.Println(" download + OS-specific install instructions (Windows, macOS,")
+	log.Println(" Linux, Android, iOS) - substitute this host's real address")
+	log.Println(" if they're connecting over the network instead of localhost.")
+	log.Println("")
+	log.Printf(" Export while the proxy is running: %s", downloadURL)
+	log.Println(" (substitute this host's real address if connecting remotely)")
+	log.Println("")
+	log.Println("---- Easiest: download + import in one PowerShell command ----")
+	log.Printf(`Invoke-WebRequest %s -OutFile "$env:TEMP\tlsproxy-ca.crt"; Import-Certificate -FilePath "$env:TEMP\tlsproxy-ca.crt" -CertStoreLocation Cert:\CurrentUser\Root`, downloadURL)
+	log.Println("")
+	log.Println("---- Or paste the certificate PEM directly (no network needed) ----")
+	log.Println(pemText)
+	log.Println("")
+	log.Println("$pem = @'")
+	log.Println(pemText)
+	log.Println("'@")
+	log.Println(`$path = Join-Path $env:TEMP 'tlsproxy-ca.crt'`)
+	log.Println("Set-Content -Path $path -Value $pem -Encoding ascii")
+	log.Println(`Import-Certificate -FilePath $path -CertStoreLocation Cert:\CurrentUser\Root`)
+	log.Println("")
+	log.Println("---- Or certutil (Command Prompt, after saving the PEM above) ----")
+	log.Println("  certutil -addstore -user Root tlsproxy-ca.crt")
+	log.Println("  (drop -user and run elevated to install machine-wide instead)")
+	log.Println("================================================================")
+	log.Println("")
 }
 
 func printManualInstallInstructions(certPath string) {
