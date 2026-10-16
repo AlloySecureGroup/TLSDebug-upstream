@@ -220,53 +220,38 @@ Remove CA certificate from system:
 
 ## Logging Modules
 
-The proxy includes an extensible module system for filtering and modifying traffic.
+The proxy includes an extensible, **observational** module system: every
+request/response is handed to each registered module, which votes on
+whether to log it to `proxy.log` and can extract/export data as a side
+effect. Modules cannot filter, block, or modify traffic itself.
 
-### Built-in Modules
+### Built-in Modules (registered by default)
 
-**AllTrafficModule** - Logs all traffic (default)
+**AllTrafficModule** - Always votes to log every exchange
 
-**OAuthModule** - Only logs OAuth/authentication flows
+**MonitoringModule** - Feeds the web dashboard (port 4040) with captured traffic
 
-**DomainFilterModule** - Filter by domain:
-```go
-RegisterModule(&DomainFilterModule{
-    Domains: []string{"example.com", "api.github.com"},
-})
-```
+**TokenExportModule** - Extracts JWTs, OAuth tokens, and cookies to `captured_tokens.json` / `EditThisCookie_Sessions.json`
 
-**PathFilterModule** - Filter by URL path:
-```go
-RegisterModule(&PathFilterModule{
-    Paths: []string{"/api/", "/v1/users"},
-})
-```
+### Available but not registered
 
-**RequestModifierModule** - Add/remove request headers:
-```go
-RegisterModule(&RequestModifierModule{
-    AddHeaders: map[string]string{"X-Custom": "value"},
-    RemoveHeaders: []string{"User-Agent"},
-})
-```
-
-**ResponseModifierModule** - Add/remove response headers
+**OAuthModule** - Only votes to log OAuth/authentication-looking requests; defined in `tlsproxy.go` but not added in `initializeModules()` today (with `AllTrafficModule` also registered, logging is effectively "log everything" regardless).
 
 ### Enable Modules
 
 Edit `initializeModules()` in `tlsproxy.go`:
 ```go
 func initializeModules() {
-    // Default
     RegisterModule(&AllTrafficModule{})
-    
-    // Or use filters
+    RegisterModule(NewMonitoringModule())
+    RegisterModule(NewTokenExportModule())
+
+    // Also available:
     // RegisterModule(&OAuthModule{})
-    // RegisterModule(&DomainFilterModule{Domains: []string{"example.com"}})
 }
 ```
 
-See `MODULES.md` for creating custom modules.
+See `MODULES.md` for the full module reference and a guide to writing custom modules.
 
 ## Configuration File
 
