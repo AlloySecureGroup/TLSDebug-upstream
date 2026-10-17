@@ -43,6 +43,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -191,6 +192,7 @@ type EditThisCookieExport struct {
 	Session        bool    `json:"session"`
 	StoreId        string  `json:"storeId"`
 	Value          string  `json:"value"`
+	ID             int     `json:"id"`
 }
 
 type TokenExport struct {
@@ -200,6 +202,11 @@ type TokenExport struct {
 	LastUpdated time.Time              `json:"last_updated"`
 }
 
+const (
+	capturedTokensFile = "captured_tokens.json"
+	cookieExportFile   = "EditThisCookie_Sessions.json"
+)
+
 var (
 	tokenExportMutex sync.Mutex
 	tokenExport      = &TokenExport{
@@ -207,7 +214,12 @@ var (
 		OAuthTokens: make([]OAuthToken, 0),
 		Cookies:     make([]EditThisCookieExport, 0),
 	}
+	// exportDir is the certificate directory, so session files sit next to proxy.log.
+	exportDir    = "."
+	nextCookieID = 1
 )
+
+var jwtPattern = regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)
 
 // ============================================================================
 // JWT PARSING
@@ -290,21 +302,41 @@ func base64DecodeSegment(seg string) ([]byte, error) {
 
 func extractJWTFromString(text string, source string, requestURL string) []*JWTToken {
 	var tokens []*JWTToken
-
-	// Pattern: eyJ... (typical JWT start)
-	words := strings.Fields(text)
-	for _, word := range words {
-		// Remove common surrounding characters
-		word = strings.Trim(word, `"',;:()[]{}`)
-
-		if strings.HasPrefix(word, "eyJ") && strings.Count(word, ".") == 2 {
-			if jwt := parseJWT(word, source, requestURL); jwt != nil {
-				tokens = append(tokens, jwt)
-			}
+	seen := make(map[string]struct{})
+	for _, match := range jwtPattern.FindAllString(text, -1) {
+		if _, ok := seen[match]; ok {
+			continue
+		}
+		seen[match] = struct{}{}
+		if jwt := parseJWT(match, source, requestURL); jwt != nil {
+			tokens = append(tokens, jwt)
 		}
 	}
-
 	return tokens
+}
+
+func bearerToken(header string) string {
+	fields := strings.SplitN(strings.TrimSpace(header), " ", 2)
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(fields[1])
+}
+
+func tryAddJWT(raw string, source string, requestURL string) {
+	raw = strings.TrimSpace(raw)
+	if jwt := parseJWT(raw, source, requestURL); jwt != nil {
+		addJWTToken(jwt)
+	}
+}
+
+func recordOAuthToken(token *OAuthToken) {
+	if token == nil {
+		return
+	}
+	addOAuthToken(token)
+	tryAddJWT(token.AccessToken, token.Source+" (access_token)", token.URL)
+	tryAddJWT(token.IDToken, token.Source+" (id_token)", token.URL)
 }
 
 func extractOAuthTokensFromJSON(body string, source string, requestURL string) *OAuthToken {
@@ -420,23 +452,14 @@ func (m *TokenExportModule) ProcessRequest(req *http.Request) error {
 
 	reqURL := req.URL.String()
 
-	// Extract JWT from Authorization header
-	if authHeader := req.Header.Get("Authorization"); authHeader != "" {
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-			if jwt := parseJWT(tokenString, "Request Authorization Header", reqURL); jwt != nil {
-				addJWTToken(jwt)
-			}
-		}
+	// Extract JWT from Authorization header (scheme is case-insensitive)
+	if tokenString := bearerToken(req.Header.Get("Authorization")); tokenString != "" {
+		tryAddJWT(tokenString, "Request Authorization Header", reqURL)
 	}
 
 	// Extract JWT from cookies
 	for _, cookie := range req.Cookies() {
-		if strings.HasPrefix(cookie.Value, "eyJ") && strings.Count(cookie.Value, ".") == 2 {
-			if jwt := parseJWT(cookie.Value, fmt.Sprintf("Request Cookie: %s", cookie.Name), reqURL); jwt != nil {
-				addJWTToken(jwt)
-			}
-		}
+		tryAddJWT(cookie.Value, fmt.Sprintf("Request Cookie: %s", cookie.Name), reqURL)
 	}
 
 	// Extract from request body (POST/PUT)
@@ -445,33 +468,27 @@ func (m *TokenExportModule) ProcessRequest(req *http.Request) error {
 		if err == nil && bodyBytes != nil {
 			// Try to decompress if gzip encoded
 			displayBytes := bodyBytes
-			contentEncoding := req.Header.Get("Content-Encoding")
-			if contentEncoding == "gzip" && len(bodyBytes) > 0 {
-				gzipReader, err := gzip.NewReader(bytes.NewReader(bodyBytes))
-				if err == nil {
-					decompressed, err := io.ReadAll(gzipReader)
-					gzipReader.Close()
-					if err == nil {
-						displayBytes = decompressed
-					}
+			if strings.EqualFold(req.Header.Get("Content-Encoding"), "gzip") && len(bodyBytes) > 0 {
+				if decompressed, err := gunzipBytes(bodyBytes); err == nil {
+					displayBytes = decompressed
 				}
 			}
 
 			if !isBinaryContent(displayBytes) {
 				bodyStr := string(displayBytes)
-				contentType := req.Header.Get("Content-Type")
+				contentType := strings.ToLower(req.Header.Get("Content-Type"))
 
 				// Try JSON OAuth tokens
 				if strings.Contains(contentType, "application/json") {
 					if token := extractOAuthTokensFromJSON(bodyStr, "Request Body (JSON)", reqURL); token != nil {
-						addOAuthToken(token)
+						recordOAuthToken(token)
 					}
 				}
 
 				// Try form-encoded OAuth tokens
 				if strings.Contains(contentType, "application/x-www-form-urlencoded") {
 					if token := extractOAuthTokensFromForm(bodyStr, "Request Body (Form)", reqURL); token != nil {
-						addOAuthToken(token)
+						recordOAuthToken(token)
 					}
 				}
 
@@ -499,17 +516,16 @@ func (m *TokenExportModule) ProcessRequest(req *http.Request) error {
 			if rt := values.Get("refresh_token"); rt != "" {
 				token.RefreshToken = rt
 			}
-			addOAuthToken(token)
+			if idt := values.Get("id_token"); idt != "" {
+				token.IDToken = idt
+			}
+			recordOAuthToken(token)
 		}
 
 		// Check for JWT in URL parameters
-		for key, values := range values {
-			for _, value := range values {
-				if strings.HasPrefix(value, "eyJ") && strings.Count(value, ".") == 2 {
-					if jwt := parseJWT(value, fmt.Sprintf("URL Parameter: %s", key), reqURL); jwt != nil {
-						addJWTToken(jwt)
-					}
-				}
+		for key, vals := range values {
+			for _, value := range vals {
+				tryAddJWT(value, fmt.Sprintf("URL Parameter: %s", key), reqURL)
 			}
 		}
 	}
@@ -518,87 +534,68 @@ func (m *TokenExportModule) ProcessRequest(req *http.Request) error {
 }
 
 func (m *TokenExportModule) ProcessResponse(resp *http.Response) error {
-	if resp == nil || resp.Body == nil {
+	if resp == nil {
 		return nil
 	}
 
-	respURL := resp.Request.URL.String()
+	// Cookies are independent of whether the body can be decoded.
+	exportResponseCookies(resp)
 
-	// Extract JWT from Authorization header in response
-	if authHeader := resp.Header.Get("Authorization"); authHeader != "" {
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-			if jwt := parseJWT(tokenString, "Response Authorization Header", respURL); jwt != nil {
-				addJWTToken(jwt)
-			}
-		}
+	respURL := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		respURL = resp.Request.URL.String()
 	}
 
-	// Extract from Set-Cookie headers
+	if tokenString := bearerToken(resp.Header.Get("Authorization")); tokenString != "" {
+		tryAddJWT(tokenString, "Response Authorization Header", respURL)
+	}
+
 	for _, cookie := range resp.Cookies() {
-		if strings.HasPrefix(cookie.Value, "eyJ") && strings.Count(cookie.Value, ".") == 2 {
-			if jwt := parseJWT(cookie.Value, fmt.Sprintf("Response Cookie: %s", cookie.Name), respURL); jwt != nil {
-				addJWTToken(jwt)
-			}
-		}
+		tryAddJWT(cookie.Value, fmt.Sprintf("Response Cookie: %s", cookie.Name), respURL)
 	}
 
-	// Extract from response body
-	encoding := resp.Header.Get("Content-Encoding")
-	if encoding == "br" || encoding == "zstd" || encoding == "deflate" {
-		return nil // Skip unsupported compressions
+	if resp.Body == nil {
+		return nil
 	}
 
-	var reader io.Reader = resp.Body
-	if encoding == "gzip" {
-		gzipReader, err := gzip.NewReader(resp.Body)
+	// Inspect a copy. The bytes and Content-Encoding forwarded to the client stay intact.
+	bodyBytes, err := readAndRestoreResponseBody(resp)
+	if err != nil || len(bodyBytes) == 0 {
+		return nil
+	}
+
+	displayBytes := bodyBytes
+	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+	case "gzip":
+		decompressed, err := gunzipBytes(bodyBytes)
 		if err != nil {
 			return nil
 		}
-		reader = gzipReader
-		defer gzipReader.Close()
-	}
-
-	bodyBytes, err := io.ReadAll(reader)
-	if err != nil {
+		displayBytes = decompressed
+	case "br", "zstd", "deflate":
 		return nil
 	}
 
-	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	if encoding == "gzip" {
-		resp.Header.Del("Content-Encoding")
-		resp.ContentLength = int64(len(bodyBytes))
-		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyBytes)))
+	if isBinaryContent(displayBytes) {
+		return nil
 	}
 
-	if !isBinaryContent(bodyBytes) {
-		bodyStr := string(bodyBytes)
-		contentType := resp.Header.Get("Content-Type")
-
-		// Try JSON OAuth tokens
-		if strings.Contains(contentType, "application/json") {
-			if token := extractOAuthTokensFromJSON(bodyStr, "Response Body (JSON)", respURL); token != nil {
-				addOAuthToken(token)
-
-				// Also check if id_token is a JWT
-				if token.IDToken != "" && strings.HasPrefix(token.IDToken, "eyJ") {
-					if jwt := parseJWT(token.IDToken, "Response Body (ID Token)", respURL); jwt != nil {
-						addJWTToken(jwt)
-					}
-				}
-			}
+	bodyStr := string(displayBytes)
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "application/json") {
+		if token := extractOAuthTokensFromJSON(bodyStr, "Response Body (JSON)", respURL); token != nil {
+			recordOAuthToken(token)
 		}
-
-		// Extract JWTs from body text
-		jwts := extractJWTFromString(bodyStr, "Response Body", respURL)
-		for _, jwt := range jwts {
-			addJWTToken(jwt)
+	}
+	if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+		if token := extractOAuthTokensFromForm(bodyStr, "Response Body (Form)", respURL); token != nil {
+			recordOAuthToken(token)
 		}
 	}
 
-	// Export cookies as before
-	exportResponseCookies(resp)
+	for _, jwt := range extractJWTFromString(bodyStr, "Response Body", respURL) {
+		addJWTToken(jwt)
+	}
 
 	return nil
 }
@@ -645,7 +642,7 @@ func addOAuthToken(token *OAuthToken) {
 
 	// Check for duplicates
 	for _, existing := range tokenExport.OAuthTokens {
-		if existing.AccessToken == token.AccessToken && existing.RefreshToken == token.RefreshToken {
+		if existing.AccessToken == token.AccessToken && existing.RefreshToken == token.RefreshToken && existing.IDToken == token.IDToken {
 			return
 		}
 	}
@@ -667,23 +664,152 @@ func addOAuthToken(token *OAuthToken) {
 	saveTokenExport()
 }
 
+func exportFilePath(name string) string {
+	return filepath.Join(exportDir, name)
+}
+
+func loadTokenExport() {
+	tokenExportMutex.Lock()
+	defer tokenExportMutex.Unlock()
+
+	path := exportFilePath(capturedTokensFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[EXPORT] ERROR: Failed to read existing tokens: %v", err)
+		}
+		return
+	}
+
+	var loaded TokenExport
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		log.Printf("[EXPORT] ERROR: Failed to parse existing tokens from %s: %v", path, err)
+		return
+	}
+	if loaded.JWTTokens == nil {
+		loaded.JWTTokens = make([]JWTToken, 0)
+	}
+	if loaded.OAuthTokens == nil {
+		loaded.OAuthTokens = make([]OAuthToken, 0)
+	}
+	if loaded.Cookies == nil {
+		loaded.Cookies = make([]EditThisCookieExport, 0)
+	}
+	tokenExport = &loaded
+	nextCookieID = 1
+	normalizeLoadedCookies()
+	log.Printf("[EXPORT] Loaded %d JWTs, %d OAuth tokens, %d cookies from %s",
+		len(tokenExport.JWTTokens), len(tokenExport.OAuthTokens), len(tokenExport.Cookies), path)
+}
+
+func normalizeLoadedCookies() {
+	for i := range tokenExport.Cookies {
+		cookie := &tokenExport.Cookies[i]
+		if cookie.Path == "" {
+			cookie.Path = "/"
+		}
+		if !cookie.HostOnly && cookie.Domain != "" && !strings.HasPrefix(cookie.Domain, ".") {
+			cookie.Domain = "." + cookie.Domain
+		}
+		if cookie.ID == 0 {
+			cookie.ID = nextCookieID
+			nextCookieID++
+		} else if cookie.ID >= nextCookieID {
+			nextCookieID = cookie.ID + 1
+		}
+	}
+}
+
+// saveTokenExport writes both JSON exports. Caller must hold tokenExportMutex.
 func saveTokenExport() {
-	filename := "captured_tokens.json"
+	sort.Slice(tokenExport.Cookies, func(i, j int) bool {
+		a, b := tokenExport.Cookies[i], tokenExport.Cookies[j]
+		if a.Domain != b.Domain {
+			return a.Domain < b.Domain
+		}
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		return a.ID < b.ID
+	})
 
 	jsonData, err := json.MarshalIndent(tokenExport, "", "    ")
 	if err != nil {
 		log.Printf("[EXPORT] ERROR: Failed to marshal tokens JSON: %v", err)
 		return
 	}
-
-	err = os.WriteFile(filename, jsonData, 0600) // Restrictive permissions
-	if err != nil {
-		log.Printf("[EXPORT] ERROR: Failed to write tokens file %s: %v", filename, err)
+	tokensPath := exportFilePath(capturedTokensFile)
+	if err := writeRestrictedFile(tokensPath, jsonData); err != nil {
+		log.Printf("[EXPORT] ERROR: Failed to write tokens file %s: %v", tokensPath, err)
 		return
 	}
 
-	log.Printf("[EXPORT] ✓ Saved %d JWTs, %d OAuth tokens, %d cookies to %s",
-		len(tokenExport.JWTTokens), len(tokenExport.OAuthTokens), len(tokenExport.Cookies), filename)
+	cookieData, err := json.MarshalIndent(tokenExport.Cookies, "", "    ")
+	if err != nil {
+		log.Printf("[EXPORT] ERROR: Failed to marshal cookies JSON: %v", err)
+		return
+	}
+	cookiePath := exportFilePath(cookieExportFile)
+	if err := writeRestrictedFile(cookiePath, cookieData); err != nil {
+		log.Printf("[EXPORT] ERROR: Failed to write cookies file %s: %v", cookiePath, err)
+		return
+	}
+
+	log.Printf("[EXPORT] Saved %d JWTs, %d OAuth tokens, %d cookies to %s",
+		len(tokenExport.JWTTokens), len(tokenExport.OAuthTokens), len(tokenExport.Cookies), tokensPath)
+}
+
+func writeRestrictedFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tlsdebug-export-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	success := false
+	defer func() {
+		if !success {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		// Windows cannot rename over an existing file.
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			return err
+		}
+		if err := os.Rename(tmpName, path); err != nil {
+			return err
+		}
+	}
+	success = true
+	return os.Chmod(path, 0600)
+}
+
+func openProxyLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // ============================================================================
@@ -703,60 +829,56 @@ func exportResponseCookies(resp *http.Response) {
 	tokenExportMutex.Lock()
 	defer tokenExportMutex.Unlock()
 
-	cookieMap := make(map[string]EditThisCookieExport)
+	cookieMap := make(map[string]EditThisCookieExport, len(tokenExport.Cookies)+len(setCookies))
 	for _, existing := range tokenExport.Cookies {
-		key := fmt.Sprintf("%s|%s", existing.Name, existing.Domain)
-		cookieMap[key] = existing
+		cookieMap[cookieIdentity(existing.Name, existing.Domain, existing.Path)] = existing
 	}
 
+	changed := false
 	for _, cookie := range setCookies {
-		sameSite := "unspecified"
-		switch cookie.SameSite {
-		case http.SameSiteStrictMode:
-			sameSite = "strict"
-		case http.SameSiteLaxMode:
-			sameSite = "lax"
-		case http.SameSiteNoneMode:
-			sameSite = "no_restriction"
-		}
-
-		domain := cookie.Domain
-		hostOnly := cookie.Domain == ""
-
-		if domain == "" {
-			if resp.Request != nil {
-				domain = resp.Request.URL.Hostname()
-				if domain == "" {
-					domain = resp.Request.Host
-				}
-			}
-		}
-
+		domain, hostOnly := cookieExportDomain(cookie, resp)
 		path := cookie.Path
 		if path == "" {
 			path = "/"
 		}
+		key := cookieIdentity(cookie.Name, domain, path)
+
+		if cookie.MaxAge < 0 {
+			if _, ok := cookieMap[key]; ok {
+				delete(cookieMap, key)
+				changed = true
+			}
+			continue
+		}
+
+		existing, exists := cookieMap[key]
+		id := existing.ID
+		if !exists {
+			id = nextCookieID
+			nextCookieID++
+		}
 
 		etcCookie := EditThisCookieExport{
 			Domain:         domain,
-			ExpirationDate: 0,
+			ExpirationDate: cookieExpiration(cookie),
 			HostOnly:       hostOnly,
 			HttpOnly:       cookie.HttpOnly,
 			Name:           cookie.Name,
 			Path:           path,
-			SameSite:       sameSite,
+			SameSite:       sameSiteValue(cookie.SameSite),
 			Secure:         cookie.Secure,
 			Session:        cookie.MaxAge == 0 && cookie.Expires.IsZero(),
 			StoreId:        "0",
 			Value:          cookie.Value,
+			ID:             id,
 		}
-
-		if !cookie.Expires.IsZero() {
-			etcCookie.ExpirationDate = float64(cookie.Expires.Unix()) + float64(cookie.Expires.Nanosecond())/1e9
+		if !exists || etcCookie != existing {
+			cookieMap[key] = etcCookie
+			changed = true
 		}
-
-		key := fmt.Sprintf("%s|%s", etcCookie.Name, etcCookie.Domain)
-		cookieMap[key] = etcCookie
+	}
+	if !changed {
+		return
 	}
 
 	tokenExport.Cookies = make([]EditThisCookieExport, 0, len(cookieMap))
@@ -764,14 +886,56 @@ func exportResponseCookies(resp *http.Response) {
 		tokenExport.Cookies = append(tokenExport.Cookies, cookie)
 	}
 	tokenExport.LastUpdated = time.Now()
-
-	// Also save to old format for compatibility
-	jsonData, err := json.MarshalIndent(tokenExport.Cookies, "", "    ")
-	if err == nil {
-		os.WriteFile("EditThisCookie_Sessions.json", jsonData, 0644)
-	}
-
 	saveTokenExport()
+}
+
+func cookieIdentity(name, domain, path string) string {
+	return name + "|" + domain + "|" + path
+}
+
+func cookieExportDomain(cookie *http.Cookie, resp *http.Response) (string, bool) {
+	if cookie.Domain == "" {
+		domain := ""
+		if resp.Request != nil && resp.Request.URL != nil {
+			domain = resp.Request.URL.Hostname()
+		}
+		if domain == "" && resp.Request != nil {
+			domain = resp.Request.Host
+			if host, _, err := net.SplitHostPort(domain); err == nil {
+				domain = host
+			}
+		}
+		return domain, true
+	}
+	domain := cookie.Domain
+	if !strings.HasPrefix(domain, ".") {
+		domain = "." + domain
+	}
+	return domain, false
+}
+
+func cookieExpiration(cookie *http.Cookie) float64 {
+	if !cookie.Expires.IsZero() {
+		return float64(cookie.Expires.UnixNano()) / 1e9
+	}
+	if cookie.MaxAge > 0 {
+		exp := time.Now().Add(time.Duration(cookie.MaxAge) * time.Second)
+		return float64(exp.UnixNano()) / 1e9
+	}
+	return 0
+}
+
+func sameSiteValue(mode http.SameSite) string {
+	switch mode {
+	case http.SameSiteStrictMode:
+		return "strict"
+	case http.SameSiteLaxMode:
+		return "lax"
+	case http.SameSiteNoneMode:
+		return "no_restriction"
+	default:
+		return "unspecified"
+	}
 }
 
 // ============================================================================
@@ -802,6 +966,52 @@ func readAndRestoreRequestBody(req *http.Request) ([]byte, error) {
 	req.Header.Del("Transfer-Encoding")
 
 	return bodyBytes, nil
+}
+
+// readAndRestoreResponseBody buffers the response body and puts the same
+// bytes back. Callers may decompress a copy; the forwarded body is unchanged.
+func readAndRestoreResponseBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+	original := resp.Body
+	bodyBytes, err := io.ReadAll(original)
+	original.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	return bodyBytes, err
+}
+
+func gunzipBytes(data []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func formatCapturedBody(data []byte, max int) string {
+	if isBinaryContent(data) {
+		return fmt.Sprintf("[Binary content, %d bytes]", len(data))
+	}
+	if max > 0 && len(data) > max {
+		return string(data[:max]) + fmt.Sprintf("... [truncated, %d more bytes]", len(data)-max)
+	}
+	return string(data)
+}
+
+func tlsVersionName(version uint16) string {
+	switch version {
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	default:
+		if version == 0 {
+			return ""
+		}
+		return fmt.Sprintf("0x%04x", version)
+	}
 }
 
 func sanitizeForConsole(data string) string {
@@ -955,6 +1165,11 @@ var trafficStore = &TrafficStore{
 	maxEntries: 1000,
 }
 
+// monitorRequestBodies holds request bodies captured before the upstream
+// client consumes them, keyed by the request URL pointer shared with the
+// forwarded request.
+var monitorRequestBodies sync.Map
+
 func (ts *TrafficStore) AddEntry(entry TrafficEntry) {
 	ts.Lock()
 	defer ts.Unlock()
@@ -1023,10 +1238,39 @@ func (m *MonitoringModule) ShouldLog(req *http.Request) bool {
 }
 
 func (m *MonitoringModule) ProcessRequest(req *http.Request) error {
+	if req == nil || req.URL == nil || !m.captureRequestBodies || req.Body == nil {
+		return nil
+	}
+
+	bodyBytes, err := readAndRestoreRequestBody(req)
+	if err != nil || len(bodyBytes) == 0 {
+		return nil
+	}
+
+	display := bodyBytes
+	if strings.EqualFold(req.Header.Get("Content-Encoding"), "gzip") {
+		if decompressed, err := gunzipBytes(bodyBytes); err == nil {
+			display = decompressed
+		}
+	}
+	monitorRequestBodies.Store(req.URL, formatCapturedBody(display, m.maxBodySize))
+	// Drop oldest-looking extras if forwarding fails and entries are never consumed.
+	n := 0
+	monitorRequestBodies.Range(func(key, _ any) bool {
+		n++
+		if n > 2000 {
+			monitorRequestBodies.Delete(key)
+		}
+		return true
+	})
 	return nil
 }
 
 func (m *MonitoringModule) ProcessResponse(resp *http.Response) error {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return nil
+	}
+
 	startTime := time.Now()
 
 	entry := TrafficEntry{
@@ -1040,51 +1284,34 @@ func (m *MonitoringModule) ProcessResponse(resp *http.Response) error {
 		RequestHeaders:  cloneHeaders(resp.Request.Header),
 		ResponseHeaders: cloneHeaders(resp.Header),
 		ContentType:     resp.Header.Get("Content-Type"),
-		ClientAddr:      "",
+		ClientAddr:      resp.Request.RemoteAddr,
+	}
+	if resp.Request.TLS != nil {
+		entry.TLSVersion = tlsVersionName(resp.Request.TLS.Version)
+	}
+	if body, ok := monitorRequestBodies.LoadAndDelete(resp.Request.URL); ok {
+		entry.RequestBody, _ = body.(string)
 	}
 
 	if m.captureResponseBodies && resp.Body != nil {
-		encoding := resp.Header.Get("Content-Encoding")
-
-		if encoding == "br" || encoding == "zstd" || encoding == "deflate" {
-			entry.ResponseBody = fmt.Sprintf("[Content compressed with %s - cannot display]", encoding)
-			entry.Duration = time.Since(startTime)
-			trafficStore.AddEntry(entry)
-			return nil
-		}
-
-		var reader io.Reader = resp.Body
-		wasCompressed := false
-
-		if encoding == "gzip" {
-			gzipReader, err := gzip.NewReader(resp.Body)
-			if err != nil {
-				log.Printf("[Monitor] Warning: Failed to decompress gzip response: %v", err)
-				reader = resp.Body
-			} else {
-				reader = gzipReader
-				defer gzipReader.Close()
-				wasCompressed = true
-			}
-		}
-
-		bodyBytes, err := io.ReadAll(reader)
-		if err == nil {
-			resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-			if wasCompressed {
-				resp.Header.Del("Content-Encoding")
-				resp.ContentLength = int64(len(bodyBytes))
-				resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyBytes)))
-			}
-
-			if !isBinaryContent(bodyBytes) && len(bodyBytes) <= m.maxBodySize {
-				entry.ResponseBody = string(bodyBytes)
-			} else if len(bodyBytes) > m.maxBodySize {
-				entry.ResponseBody = string(bodyBytes[:m.maxBodySize]) +
-					fmt.Sprintf("... [truncated, %d more bytes]", len(bodyBytes)-m.maxBodySize)
-			} else {
-				entry.ResponseBody = fmt.Sprintf("[Binary content, %d bytes]", len(bodyBytes))
+		encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+		bodyBytes, err := readAndRestoreResponseBody(resp)
+		if err != nil {
+			log.Printf("[Monitor] Warning: Failed to read response body: %v", err)
+		} else {
+			switch encoding {
+			case "br", "zstd", "deflate":
+				entry.ResponseBody = fmt.Sprintf("[Content compressed with %s - cannot display]", encoding)
+			case "gzip":
+				decompressed, gunzipErr := gunzipBytes(bodyBytes)
+				if gunzipErr != nil {
+					log.Printf("[Monitor] Warning: Failed to decompress gzip response: %v", gunzipErr)
+					entry.ResponseBody = formatCapturedBody(bodyBytes, m.maxBodySize)
+				} else {
+					entry.ResponseBody = formatCapturedBody(decompressed, m.maxBodySize)
+				}
+			default:
+				entry.ResponseBody = formatCapturedBody(bodyBytes, m.maxBodySize)
 			}
 		}
 	}
@@ -2483,11 +2710,14 @@ func main() {
 	}
 
 	var err error
-	logWriter, err = os.OpenFile(config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	logWriter, err = openProxyLog(config.LogFile)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 	defer logWriter.Close()
+
+	exportDir = config.CertDir
+	loadTokenExport()
 
 	initializeModules()
 
@@ -2505,10 +2735,10 @@ func main() {
 	log.Printf("Monitor interface: http://localhost:%d", *monitorPort)
 	log.Printf("CA certificate: %s", filepath.Join(config.CertDir, caCertFile))
 	log.Printf("Log file: %s", config.LogFile)
-	log.Printf("⚠️  TOKEN CAPTURE: JWT and OAuth tokens will be exported to captured_tokens.json")
-	log.Printf("⚠️  COOKIE EXPORT: Sessions will be exported to EditThisCookie_Sessions.json")
+	log.Printf("⚠️  TOKEN CAPTURE: JWT and OAuth tokens will be exported to %s", exportFilePath(capturedTokensFile))
+	log.Printf("⚠️  COOKIE EXPORT: Sessions will be exported to %s", exportFilePath(cookieExportFile))
 	log.Printf("WARNING: These files contain sensitive authentication data!")
-	log.Printf("WARNING: File permissions set to 0600 for captured_tokens.json")
+	log.Printf("WARNING: proxy.log and token exports are restricted to mode 0600")
 
 	if verboseMode {
 		log.Printf("Verbose mode: ENABLED (all traffic logged to console)")
@@ -2897,12 +3127,9 @@ func handleConnect(clientConn net.Conn, req *http.Request, config *ProxyConfig) 
 	defer tlsClientConn.Close()
 
 	state := tlsClientConn.ConnectionState()
-	tlsVersion := "unknown"
-	switch state.Version {
-	case tls.VersionTLS12:
-		tlsVersion = "TLS 1.2"
-	case tls.VersionTLS13:
-		tlsVersion = "TLS 1.3"
+	tlsVersion := tlsVersionName(state.Version)
+	if tlsVersion == "" {
+		tlsVersion = "unknown"
 	}
 	log.Printf("[TLS] %s using %s with cipher %s", host, tlsVersion, tls.CipherSuiteName(state.CipherSuite))
 
@@ -2932,6 +3159,8 @@ func handleConnect(clientConn net.Conn, req *http.Request, config *ProxyConfig) 
 
 		req.URL.Scheme = "https"
 		req.URL.Host = req.Host
+		req.RemoteAddr = clientConn.RemoteAddr().String()
+		req.TLS = &state
 
 		logRequest(req, config)
 
@@ -2966,6 +3195,7 @@ func handleHTTP(clientConn net.Conn, req *http.Request, config *ProxyConfig) {
 		req.URL.Host = req.Host
 	}
 
+	req.RemoteAddr = clientConn.RemoteAddr().String()
 	logRequest(req, config)
 
 	resp, err := forwardRequest(req)
@@ -3029,6 +3259,8 @@ func forwardRequest(req *http.Request) (*http.Response, error) {
 
 	outReq.RequestURI = ""
 	outReq.Header.Del("Proxy-Connection")
+	outReq.RemoteAddr = req.RemoteAddr
+	outReq.TLS = req.TLS
 
 	resp, err := client.Do(outReq)
 	if err != nil {
@@ -3100,22 +3332,25 @@ func logRequest(req *http.Request, config *ProxyConfig) {
 					}
 				}
 			} else if len(displayBytes) > 0 {
-				maxBodySize := 10240
-				bodyStr := string(displayBytes)
-				if len(displayBytes) > maxBodySize {
-					bodyStr = string(displayBytes[:maxBodySize]) + fmt.Sprintf("... [truncated, %d more bytes]", len(displayBytes)-maxBodySize)
-				}
-				logEntry = logEntry + fmt.Sprintf("Body: %s\n", bodyStr)
+				logEntry = logEntry + fmt.Sprintf("Body: %s\n", string(displayBytes))
 			}
 		}
 	}
 
 	if verboseMode {
-		consoleEntry := sanitizeForConsole(logEntry)
-		fmt.Print(consoleEntry)
+		consoleEntry := logEntry
+		const maxConsole = 10240
+		if len(consoleEntry) > maxConsole {
+			consoleEntry = consoleEntry[:maxConsole] + fmt.Sprintf("\n... [truncated, %d more bytes]\n", len(logEntry)-maxConsole)
+		}
+		fmt.Print(sanitizeForConsole(consoleEntry))
 	}
 
-	logWriter.WriteString(logEntry)
+	if logWriter != nil {
+		if _, err := logWriter.WriteString(logEntry); err != nil {
+			log.Printf("Failed to write log entry: %v", err)
+		}
+	}
 }
 
 func getCertForHost(host string) *tls.Certificate {

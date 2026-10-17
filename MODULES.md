@@ -49,7 +49,7 @@ func initializeModules() {
     RegisterModule(NewTokenExportModule())
 }
 ```
-([tlsproxy.go:2529](tlsproxy.go#L2529))
+([tlsproxy.go:2759](tlsproxy.go#L2759))
 
 There is no config-file or flag-driven way to enable/disable individual
 modules today — the registered set is fixed in code.
@@ -60,11 +60,11 @@ For every proxied HTTP(S) exchange:
 
 1. **`forwardRequest()`** sends the request upstream and, immediately after
    receiving the response, calls `executeModulesResponse(resp)` — running
-   every module's `ProcessResponse` ([tlsproxy.go:3038](tlsproxy.go#L3038)).
+   every module's `ProcessResponse` ([tlsproxy.go:3270](tlsproxy.go#L3270)).
 2. **`logRequest()`** then calls `executeModules(req)`, which runs every
    module's `ShouldLog` + `ProcessRequest` and returns `true` if any module
    voted to log; if so, a plain-text entry is appended to `proxy.log`
-   ([tlsproxy.go:3043-3044](tlsproxy.go#L3043)).
+   ([tlsproxy.go:3276](tlsproxy.go#L3276)).
 
 ```go
 func executeModules(req *http.Request) bool {
@@ -90,7 +90,7 @@ func executeModules(req *http.Request) bool {
 ## Registered modules
 
 ### `AllTrafficModule` — `"AllTraffic"`
-([tlsproxy.go:2383](tlsproxy.go#L2383))
+([tlsproxy.go:2610](tlsproxy.go#L2610))
 
 Always votes `true` on `ShouldLog`; no `ProcessRequest`/`ProcessResponse`
 side effects. Its only job is to guarantee that **all** traffic is written
@@ -100,13 +100,14 @@ currently redundant — removing `AllTrafficModule` is the only way to get
 selective logging based on another module's `ShouldLog` logic (e.g. `OAuthModule`, below).
 
 ### `MonitoringModule` — `"Monitor"`
-([tlsproxy.go:1003](tlsproxy.go#L1003))
+([tlsproxy.go:1232](tlsproxy.go#L1232))
 
-Feeds the web dashboard. On `ProcessResponse`, it builds a `TrafficEntry`
+Feeds the web dashboard. On `ProcessRequest` it captures the request body
+(the upstream client consumes the body later). On `ProcessResponse` it builds a `TrafficEntry`
 (method, URL, host, path, status, headers, truncated request/response
 bodies up to `maxBodySize` = 10 KB, duration, TLS version, client address)
 and appends it to the in-memory `trafficStore` (capped at the most recent
-1000 entries, [tlsproxy.go:952](tlsproxy.go#L952)).
+1000 entries). Response bodies are copied for display; `Content-Encoding` is not removed.
 
 The monitor's HTTP server (`StartMonitorServer`, default port `4040`)
 reads straight from `trafficStore` to serve:
@@ -121,41 +122,42 @@ reads straight from `trafficStore` to serve:
 | `GET /ca-cert`, `GET /ca.crt` | Download the proxy's CA certificate |
 | `GET /install-ca` | Self-service, OS-aware CA install page for remote clients |
 
-([tlsproxy.go:1110-1118](tlsproxy.go#L1110))
+([tlsproxy.go:1337](tlsproxy.go#L1337))
 
 ### `TokenExportModule` — `"TokenExport"`
-([tlsproxy.go:402](tlsproxy.go#L402))
+([tlsproxy.go:440](tlsproxy.go#L440))
 
 The most active module — always votes `true` on `ShouldLog` and extracts
 credentials from both requests and responses:
 
 - **JWTs**: from `Authorization: Bearer ...` headers (request and
   response), `Set-Cookie` values that look like a JWT, and JSON/text
-  response bodies. Parsed JWTs (header, payload, expiry, issuer, subject,
+  response bodies, including compact JSON. Parsed JWTs (header, payload, expiry, issuer, subject,
   audience, etc.) are appended to `captured_tokens.json` via
-  `addJWTToken()` / `saveTokenExport()`.
+  `addJWTToken()` / `saveTokenExport()`. Access tokens and ID tokens that are themselves JWTs are decoded too.
 - **OAuth tokens**: access/refresh tokens and related fields extracted
   from JSON or form-encoded request/response bodies
   (`extractOAuthTokensFromJSON`, `extractOAuthTokensFromForm`), appended
-  via `addOAuthToken()`.
+  via `recordOAuthToken()`.
 - **Cookies**: every `Set-Cookie` on a response is captured via
-  `exportResponseCookies()` ([tlsproxy.go:693](tlsproxy.go#L693)) and
-  written in [EditThisCookie](https://github.com/ETCExtension/EditThisCookie)-compatible
-  format.
+  `exportResponseCookies()`, including when the body uses brotli, zstd, or deflate.
+  Cookies are keyed by name, domain, and path. `Max-Age` becomes `expirationDate`;
+  `Max-Age=0` removes a previously captured cookie. Domain cookies keep a leading dot for EditThisCookie.
 
-Output files (written to the current working directory, `0600`/`0644`
-permissions, **contain live secrets** — see
-[.gitignore](.gitignore)):
+Inspection decompresses a copy of gzip bodies. The response forwarded to the client keeps its original bytes and `Content-Encoding`.
+
+Output files are written to `-certdir` (the same directory as `proxy.log`), mode `0600`, and reloaded on startup. Writes are atomic. They **contain live secrets** — see
+[.gitignore](.gitignore):
 
 | File | Written by | Contents |
 | --- | --- | --- |
 | `captured_tokens.json` | `saveTokenExport()` | All captured JWTs, OAuth tokens, *and* cookies |
-| `EditThisCookie_Sessions.json` | `exportResponseCookies()` | Cookies only, in EditThisCookie's import format |
+| `EditThisCookie_Sessions.json` | `saveTokenExport()` | Cookies only, in EditThisCookie's import format |
 
 ## Defined but not registered
 
 ### `OAuthModule` — `"OAuth"`
-([tlsproxy.go:2401](tlsproxy.go#L2401))
+([tlsproxy.go:2628](tlsproxy.go#L2628))
 
 A selective module whose `ShouldLog` only returns `true` when the request
 URL/path matches common OAuth/OIDC patterns (`/oauth`, `/token`,
@@ -173,7 +175,7 @@ stays registered).
 
 A stray comment in the source —
 `// ... (rest of the existing modules: DomainFilter, RequestModifier, etc.) ...`
-([tlsproxy.go:2441](tlsproxy.go#L2441)) — references a `DomainFilter` and
+([tlsproxy.go:2668](tlsproxy.go#L2668)) — references a `DomainFilter` and
 a `RequestModifier` module. **Neither exists in the codebase.** Treat this
 as an aspirational note left over from an earlier draft, not a feature
 that's currently available.

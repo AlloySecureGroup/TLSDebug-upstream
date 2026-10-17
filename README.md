@@ -231,7 +231,7 @@ effect. Modules cannot filter, block, or modify traffic itself.
 
 **MonitoringModule** - Feeds the web dashboard (port 4040) with captured traffic
 
-**TokenExportModule** - Extracts JWTs, OAuth tokens, and cookies to `captured_tokens.json` / `EditThisCookie_Sessions.json`
+**TokenExportModule** - Extracts JWTs, OAuth tokens, and cookies to `captured_tokens.json` / `EditThisCookie_Sessions.json` in `-certdir` (mode `0600`)
 
 ### Available but not registered
 
@@ -311,8 +311,9 @@ Headers:
 **Output Sanitization:**
 - Control characters are escaped to prevent terminal beeping
 - Binary content shown as `[Binary data, N bytes]`
-- Large bodies (>10KB) truncated in console
-- Full raw data always in `proxy.log`
+- Large bodies (>10KB) truncated in console output only
+- Full text bodies are written to `proxy.log`
+- `proxy.log`, `captured_tokens.json`, and `EditThisCookie_Sessions.json` are created in `-certdir` with mode `0600`
 
 ## Troubleshooting
 
@@ -429,7 +430,9 @@ GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o tlsproxy-mac-arm tlsproxy.
 - `proxy-config.ini` - Configuration (optional)
 - `proxy-ca.crt` - CA certificate (install this)
 - `proxy-ca.key` - CA private key (keep secure)
-- `proxy.log` - Traffic logs
+- `proxy.log` - Traffic logs (mode `0600`, in `-certdir`)
+- `captured_tokens.json` - Captured JWTs, OAuth tokens, and cookies (mode `0600`, in `-certdir`)
+- `EditThisCookie_Sessions.json` - Cookie import file (mode `0600`, in `-certdir`)
 - `install-cert-windows.bat` - Windows installer
 - `MODULES.md` - Module development guide
 
