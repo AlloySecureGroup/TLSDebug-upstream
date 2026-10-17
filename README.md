@@ -1,6 +1,6 @@
 # TLS Debugging Proxy
 
-A minimalist TLS intercepting proxy written in Go. Single file, no external dependencies, cross-platform.
+A minimalist TLS intercepting proxy written in Go. One module, no external dependencies, cross-platform. The source is split by job (`main.go`, `proxy.go`, `ca.go`, `certs.go`, `tokens.go`, `monitor.go`, and the files next to them) so each piece can be read on its own.
 
 ## Features
 
@@ -17,7 +17,7 @@ A minimalist TLS intercepting proxy written in Go. Single file, no external depe
 
 ```bash
 # Build
-go build tlsproxy.go
+go build -o tlsproxy .
 
 # Run (attempts automatic certificate installation)
 ./tlsproxy
@@ -36,28 +36,8 @@ SHA-256 fingerprint with the relevant Windows, macOS, or Linux trust store.
 It reuses a matching CA without changing the trust store and invokes the
 platform installer only when that exact CA is absent.
 
-Keep both files together and protect `proxy-ca.key`. Copying only one file or
-replacing either file creates an unusable pair.
-
-### Remote Browser Lab
-
-The Docker labs build a CA into each image and copy it to the bind-mounted
-`./logs` directory on first run. Later container starts and image rebuilds
-reuse the valid persistent pair from `./logs`. The bundled Manifest V3 Chrome
-extension configures the browser to use `127.0.0.1:8080`; no certificate-error
-bypass flags are used.
-
-To rotate the lab CA:
-
-1. Stop the container.
-2. Remove `logs/proxy-ca.crt` and `logs/proxy-ca.key`.
-3. Rebuild the image with `docker compose build --no-cache`.
-4. Start the container and restart any external clients that trusted the old CA.
-
-The CA private key is not committed to Git, but it is present in the built
-container image and in `./logs`. Anyone who can read either can issue
-certificates trusted by that lab. Do not distribute the image or trust its CA
-outside controlled debugging environments.
+Keep both files together and protect `proxy-ca.key`. The key is written mode
+`0600`. Copying only one file or replacing either file creates an unusable pair.
 
 ### Windows
 
@@ -235,11 +215,11 @@ effect. Modules cannot filter, block, or modify traffic itself.
 
 ### Available but not registered
 
-**OAuthModule** - Only votes to log OAuth/authentication-looking requests; defined in `tlsproxy.go` but not added in `initializeModules()` today (with `AllTrafficModule` also registered, logging is effectively "log everything" regardless).
+**OAuthModule** - Only votes to log OAuth/authentication-looking requests; defined in `modules.go` but not added in `initializeModules()` today (with `AllTrafficModule` also registered, logging is effectively "log everything" regardless).
 
 ### Enable Modules
 
-Edit `initializeModules()` in `tlsproxy.go`:
+Edit `initializeModules()` in `main.go`:
 ```go
 func initializeModules() {
     RegisterModule(&AllTrafficModule{})
@@ -255,7 +235,12 @@ See `MODULES.md` for the full module reference and a guide to writing custom mod
 
 ## Configuration File
 
-Optional `proxy-config.ini` for advanced settings:
+Optional `proxy-config.ini` for advanced settings.
+
+`[server]` is a default for the matching flag. `-port`, `-certdir`, and
+`-skip-install` win when they are present on the command line, even if the
+value typed is the flag's own default. Omit the flag to take the value from
+the file.
 
 ```ini
 [server]
@@ -367,6 +352,14 @@ If you see certificate errors in Chrome after system installation:
 
 ## Technical Details
 
+### HTTP and compression
+
+The proxy speaks HTTP/1.1 only. A cleartext HTTP/2 preface (`PRI`) is rejected, the TLS listener does not advertise `h2`, and the connection to the origin is HTTP/1.1 as well. Browsers fall back to HTTP/1.1 inside the tunnel.
+
+Gzip bodies are decompressed for the dashboard, `proxy.log` request bodies, and token scanning. The bytes and `Content-Encoding` forwarded to the client are the originals. Brotli, zstd, and deflate are not decoded; `Set-Cookie` is still captured, and the dashboard says the body could not be displayed.
+
+One shared HTTP client talks to origin servers, so connections are reused. Redirects are returned to the browser rather than followed by the proxy. Hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authorization`, `Transfer-Encoding`, `Upgrade`, and the names listed in `Connection`) are removed before a message is forwarded.
+
 ### TLS Support
 
 **Versions:** TLS 1.2, TLS 1.3
@@ -400,40 +393,55 @@ openssl x509 -in proxy-ca.crt -text -noout
 
 ## Security Notes
 
- **This tool performs averdary-in-the-middle TLS interception:**
+**This tool performs man-in-the-middle TLS interception:**
 - Only use on networks/applications you own or control
 - Keep `proxy-ca.key` secure (never share)
 - Remove CA certificate when done testing
 - Never use in production environments
+- The monitor (port 4040 by default) has no authentication and listens on all interfaces, because `/install-ca` is how a remote client downloads the CA. Anyone who can reach that port can read captured traffic and download the CA certificate. Do not expose it beyond a network you control.
 
 ## Build for Other Platforms
 
 ```bash
 # Linux
-GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o tlsproxy-linux tlsproxy.go
+GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o tlsproxy-linux .
 
 # Windows (PowerShell)
-$env:GOOS="windows"; $env:GOARCH="amd64"; go build -ldflags "-s -w" -o tlsproxy.exe tlsproxy.go
+$env:GOOS="windows"; $env:GOARCH="amd64"; go build -ldflags "-s -w" -o tlsproxy.exe .
 
 # Windows (CMD)
-set GOOS=windows&& set GOARCH=amd64&& go build -ldflags "-s -w" -o tlsproxy.exe tlsproxy.go
+set GOOS=windows&& set GOARCH=amd64&& go build -ldflags "-s -w" -o tlsproxy.exe .
 
 # macOS (Intel)
-GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w" -o tlsproxy-mac tlsproxy.go
+GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w" -o tlsproxy-mac .
 
 # macOS (Apple Silicon)
-GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o tlsproxy-mac-arm tlsproxy.go
+GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o tlsproxy-mac-arm .
 ```
 
 ## Files
 
+Source, still `package main`:
+
+- `main.go` - Flags, startup, module registration
+- `config.go` - `proxy-config.ini`
+- `ca.go` - CA generate, load, trust-store check, install
+- `certs.go` - Per-host leaf certificates
+- `proxy.go` - Accept loop, CONNECT, forwarding
+- `modules.go` - `LogModule`, AllTraffic, OAuth example
+- `logging.go` - `proxy.log` and body buffering
+- `tokens.go` - JWT, OAuth, and cookie export
+- `monitor.go` - Dashboard store and JSON API
+- `monitor_page.go` - Dashboard and CA install pages
+
+Runtime:
+
 - `proxy-config.ini` - Configuration (optional)
 - `proxy-ca.crt` - CA certificate (install this)
-- `proxy-ca.key` - CA private key (keep secure)
+- `proxy-ca.key` - CA private key (mode `0600`, keep secure)
 - `proxy.log` - Traffic logs (mode `0600`, in `-certdir`)
-- `captured_tokens.json` - Captured JWTs, OAuth tokens, and cookies (mode `0600`, in `-certdir`)
+- `captured_tokens.json` - Captured JWTs, OAuth tokens, and cookies (mode `0600`, in `-certdir`). JWTs and OAuth tokens are capped at the newest 1000.
 - `EditThisCookie_Sessions.json` - Cookie import file (mode `0600`, in `-certdir`)
-- `install-cert-windows.bat` - Windows installer
 - `MODULES.md` - Module development guide
 
 ## License

@@ -4,7 +4,9 @@ TLSDebug's traffic inspection is built around a small plugin system:
 every decrypted request/response that passes through the proxy is handed
 to a list of registered **modules**, each of which decides whether to log
 it and what to do with it. This document describes that system as it
-exists today in [tlsproxy.go](tlsproxy.go).
+exists today. The implementation lives in [modules.go](modules.go),
+[main.go](main.go) (`initializeModules`), [monitor.go](monitor.go),
+[tokens.go](tokens.go), [proxy.go](proxy.go), and [logging.go](logging.go).
 
 ## The `LogModule` interface
 
@@ -16,7 +18,7 @@ type LogModule interface {
     ProcessResponse(resp *http.Response) error
 }
 ```
-([tlsproxy.go:110](tlsproxy.go#L110))
+([modules.go](modules.go))
 
 | Method | Called with | Purpose |
 | --- | --- | --- |
@@ -37,10 +39,10 @@ func RegisterModule(module LogModule) {
     log.Printf("[MODULE] Registered: %s", module.Name())
 }
 ```
-([tlsproxy.go:117](tlsproxy.go#L117))
+([modules.go](modules.go))
 
 Modules are added to the global `logModules` slice at startup in
-`initializeModules()`:
+`initializeModules()` in [main.go](main.go):
 
 ```go
 func initializeModules() {
@@ -49,7 +51,7 @@ func initializeModules() {
     RegisterModule(NewTokenExportModule())
 }
 ```
-([tlsproxy.go:2759](tlsproxy.go#L2759))
+([main.go](main.go))
 
 There is no config-file or flag-driven way to enable/disable individual
 modules today — the registered set is fixed in code.
@@ -58,13 +60,18 @@ modules today — the registered set is fixed in code.
 
 For every proxied HTTP(S) exchange:
 
-1. **`forwardRequest()`** sends the request upstream and, immediately after
-   receiving the response, calls `executeModulesResponse(resp)` — running
-   every module's `ProcessResponse` ([tlsproxy.go:3270](tlsproxy.go#L3270)).
-2. **`logRequest()`** then calls `executeModules(req)`, which runs every
-   module's `ShouldLog` + `ProcessRequest` and returns `true` if any module
-   voted to log; if so, a plain-text entry is appended to `proxy.log`
-   ([tlsproxy.go:3276](tlsproxy.go#L3276)).
+1. **`logRequest()`** in [logging.go](logging.go) buffers the request body
+   once, then calls `executeModules(req)`. That runs every module's
+   `ShouldLog` and `ProcessRequest`, and returns true if any module voted
+   to log. If so, a plain-text entry is appended to `proxy.log`.
+   Later readers rewind the same buffer, so the origin still receives the
+   original bytes.
+2. **`forwardRequest()`** in [proxy.go](proxy.go) strips hop-by-hop headers,
+   stamps the start time, and sends the request on a shared HTTP client.
+   When the origin answers, it calls `executeModulesResponse(resp)`, which
+   runs every module's `ProcessResponse`. Response bodies are buffered once
+   the same way and rewound before the bytes are written to the client.
+   The dashboard duration includes this origin round trip.
 
 ```go
 func executeModules(req *http.Request) bool {
@@ -80,7 +87,7 @@ func executeModules(req *http.Request) bool {
     return shouldLog
 }
 ```
-([tlsproxy.go:122](tlsproxy.go#L122))
+([modules.go](modules.go))
 
 > **Note:** `ProcessRequest`/`ProcessResponse` run for *every* module
 > regardless of its own `ShouldLog` vote — `ShouldLog` only affects whether
@@ -90,7 +97,7 @@ func executeModules(req *http.Request) bool {
 ## Registered modules
 
 ### `AllTrafficModule` — `"AllTraffic"`
-([tlsproxy.go:2610](tlsproxy.go#L2610))
+([modules.go](modules.go))
 
 Always votes `true` on `ShouldLog`; no `ProcessRequest`/`ProcessResponse`
 side effects. Its only job is to guarantee that **all** traffic is written
@@ -100,14 +107,17 @@ currently redundant — removing `AllTrafficModule` is the only way to get
 selective logging based on another module's `ShouldLog` logic (e.g. `OAuthModule`, below).
 
 ### `MonitoringModule` — `"Monitor"`
-([tlsproxy.go:1232](tlsproxy.go#L1232))
+([monitor.go](monitor.go))
 
 Feeds the web dashboard. On `ProcessRequest` it captures the request body
 (the upstream client consumes the body later). On `ProcessResponse` it builds a `TrafficEntry`
 (method, URL, host, path, status, headers, truncated request/response
-bodies up to `maxBodySize` = 10 KB, duration, TLS version, client address)
+bodies up to `maxBodySize` = 10 KiB, duration, TLS version, client address)
 and appends it to the in-memory `trafficStore` (capped at the most recent
-1000 entries). Response bodies are copied for display; `Content-Encoding` is not removed.
+1000 entries). `Duration` starts just before the origin request is sent.
+Response bodies are copied for display; `Content-Encoding` is not removed.
+Gzip is decompressed for that copy. Brotli, zstd, and deflate are labeled
+and left compressed.
 
 The monitor's HTTP server (`StartMonitorServer`, default port `4040`)
 reads straight from `trafficStore` to serve:
@@ -122,10 +132,10 @@ reads straight from `trafficStore` to serve:
 | `GET /ca-cert`, `GET /ca.crt` | Download the proxy's CA certificate |
 | `GET /install-ca` | Self-service, OS-aware CA install page for remote clients |
 
-([tlsproxy.go:1337](tlsproxy.go#L1337))
+([monitor.go](monitor.go))
 
 ### `TokenExportModule` — `"TokenExport"`
-([tlsproxy.go:440](tlsproxy.go#L440))
+([tokens.go](tokens.go))
 
 The most active module — always votes `true` on `ShouldLog` and extracts
 credentials from both requests and responses:
@@ -134,7 +144,7 @@ credentials from both requests and responses:
   response), `Set-Cookie` values that look like a JWT, and JSON/text
   response bodies, including compact JSON. Parsed JWTs (header, payload, expiry, issuer, subject,
   audience, etc.) are appended to `captured_tokens.json` via
-  `addJWTToken()` / `saveTokenExport()`. Access tokens and ID tokens that are themselves JWTs are decoded too.
+  `addJWTToken()` / `persistTokenExport()`. Access tokens and ID tokens that are themselves JWTs are decoded too.
 - **OAuth tokens**: access/refresh tokens and related fields extracted
   from JSON or form-encoded request/response bodies
   (`extractOAuthTokensFromJSON`, `extractOAuthTokensFromForm`), appended
@@ -146,18 +156,18 @@ credentials from both requests and responses:
 
 Inspection decompresses a copy of gzip bodies. The response forwarded to the client keeps its original bytes and `Content-Encoding`.
 
-Output files are written to `-certdir` (the same directory as `proxy.log`), mode `0600`, and reloaded on startup. Writes are atomic. They **contain live secrets** — see
+Output files are written to `-certdir` (the same directory as `proxy.log`), mode `0600`, and reloaded on startup. Writes are atomic and happen outside the in-memory lock. JWTs and OAuth tokens are capped at the newest 1000; cookies are not capped. The files **contain live secrets** — see
 [.gitignore](.gitignore):
 
 | File | Written by | Contents |
 | --- | --- | --- |
-| `captured_tokens.json` | `saveTokenExport()` | All captured JWTs, OAuth tokens, *and* cookies |
-| `EditThisCookie_Sessions.json` | `saveTokenExport()` | Cookies only, in EditThisCookie's import format |
+| `captured_tokens.json` | `persistTokenExport()` | All captured JWTs, OAuth tokens, *and* cookies |
+| `EditThisCookie_Sessions.json` | `persistTokenExport()` | Cookies only, in EditThisCookie's import format |
 
 ## Defined but not registered
 
 ### `OAuthModule` — `"OAuth"`
-([tlsproxy.go:2628](tlsproxy.go#L2628))
+([modules.go](modules.go))
 
 A selective module whose `ShouldLog` only returns `true` when the request
 URL/path matches common OAuth/OIDC patterns (`/oauth`, `/token`,
@@ -171,14 +181,12 @@ looks like scaffolding for a future selective-logging mode (see the note
 under `AllTrafficModule` above on why it's a no-op while `AllTrafficModule`
 stays registered).
 
-## Referenced but not implemented
+## Not implemented
 
-A stray comment in the source —
-`// ... (rest of the existing modules: DomainFilter, RequestModifier, etc.) ...`
-([tlsproxy.go:2668](tlsproxy.go#L2668)) — references a `DomainFilter` and
-a `RequestModifier` module. **Neither exists in the codebase.** Treat this
-as an aspirational note left over from an earlier draft, not a feature
-that's currently available.
+`DomainFilter` and `RequestModifier` are not part of this proxy. An old
+comment in the single-file source mentioned them; that comment is gone.
+A module still cannot change the request. `ProcessRequest` and
+`ProcessResponse` are observed and their errors are logged.
 
 ## Adding a new module
 
