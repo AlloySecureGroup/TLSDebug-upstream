@@ -7,6 +7,9 @@
 *.test
 *.out
 tlsproxy
+tlsproxy-mac
+tlsproxy-mac-arm
+tlsproxy-linux
 tlsdebug
 /bin/
 /dist/

@@ -16,7 +16,7 @@ A minimalist TLS intercepting proxy written in Go. One module, no external depen
 ## Quick Start
 
 ```bash
-# Build
+# Build the package in this directory.
 go build -o tlsproxy .
 
 # Run (attempts automatic certificate installation)
@@ -25,6 +25,9 @@ go build -o tlsproxy .
 # Skip automatic installation
 ./tlsproxy --skip-install
 ```
+
+`go build` compiles the module in the current directory. The source is several
+`package main` files, so the argument is `.`.
 
 The proxy listens on `localhost:8080` by default.
 
@@ -402,7 +405,16 @@ openssl x509 -in proxy-ca.crt -text -noout
 
 ## Build for Other Platforms
 
+Each command builds this directory as one package. On Apple Silicon the
+native binary is `tlsproxy-mac-arm`.
+
 ```bash
+# macOS (Apple Silicon)
+GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o tlsproxy-mac-arm .
+
+# macOS (Intel)
+GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w" -o tlsproxy-mac .
+
 # Linux
 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o tlsproxy-linux .
 
@@ -411,18 +423,13 @@ $env:GOOS="windows"; $env:GOARCH="amd64"; go build -ldflags "-s -w" -o tlsproxy.
 
 # Windows (CMD)
 set GOOS=windows&& set GOARCH=amd64&& go build -ldflags "-s -w" -o tlsproxy.exe .
-
-# macOS (Intel)
-GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w" -o tlsproxy-mac .
-
-# macOS (Apple Silicon)
-GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o tlsproxy-mac-arm .
 ```
 
 ## Files
 
 Source, still `package main`:
 
+- `go.mod` - Module path `tlsdebug`, standard library only
 - `main.go` - Flags, startup, module registration
 - `config.go` - `proxy-config.ini`
 - `ca.go` - CA generate, load, trust-store check, install
@@ -433,6 +440,7 @@ Source, still `package main`:
 - `tokens.go` - JWT, OAuth, and cookie export
 - `monitor.go` - Dashboard store and JSON API
 - `monitor_page.go` - Dashboard and CA install pages
+- `tlsproxy_test.go` - CA fingerprint tests (`go test .`)
 
 Runtime:
 
